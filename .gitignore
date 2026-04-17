@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Training / logging / benchmarks
+wandb/
+outputs/
+workspace*/
+experiments/
+results/
+bench/
+
+# Model checkpoints
+checkpoints/
+
+# Local dataset roots (tracked: data/DATA.md)
+data/dl3dv
+data/dl3dv_eval
+
+# Tooling
+.vscode/
+.mypy_cache/
+.pytest_cache/
+
+# OS / core dumps
+.DS_Store
+core.*

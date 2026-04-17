@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokengs"
+version = "0.1.0"
+description = "TokenGS: Decoupling 3D Gaussian Prediction from Pixels with Learnable Tokens"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = {text = "Apache-2.0"}
+dependencies = [
+    "numpy<2",
+    "tyro",
+    "einops",
+    "accelerate==0.28.0",
+    "imageio[ffmpeg]",
+    "lpips",
+    "packaging",
+    "Pillow",
+    "safetensors",
+    "scikit-image",
+    "tqdm",
+    "plyfile",
+    "tensorboard",
+    "wandb==0.17.5",
+    "torch==2.7.0",
+    "torchvision",
+    "gsplat==1.5.3",
+    "fused_ssim",
+    "matplotlib",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
