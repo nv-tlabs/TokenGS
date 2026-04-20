@@ -3,8 +3,8 @@
 ![Teaser: TokenGS results and exploration](assets/tokengs_explore.gif)
 
 **TokenGS: Decoupling 3D Gaussian Prediction from Pixels with Learnable Tokens** <br>
-Jiawei Ren*, Michal Tyszkiewicz*, Jiahui Huang, Zan Gojcic <br>
-\* indicates equal contribution
+Jiawei Ren*, Michal Tyszkiewicz*, Jiahui Huang†, Zan Gojcic† <br>
+\* indicates equal contribution, † indicates equal advising
 
 [**Paper**](https://arxiv.org/abs/2604.15239) · [**Project Page**](https://research.nvidia.com/labs/toronto-ai/tokengs/) · [**HuggingFace**]()
 
