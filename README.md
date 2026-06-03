@@ -6,7 +6,7 @@
 Jiawei Ren*, Michal Tyszkiewicz*, Jiahui Huang†, Zan Gojcic† <br>
 \* indicates equal contribution, † indicates equal advising
 
-[**Paper**](https://arxiv.org/abs/2604.15239) · [**Project Page**](https://research.nvidia.com/labs/toronto-ai/tokengs/) · [**HuggingFace**]()
+[**Paper**](https://arxiv.org/abs/2604.15239) · [**Project Page**](https://research.nvidia.com/labs/toronto-ai/tokengs/) · [**HuggingFace**](https://huggingface.co/jiaweir/tokengs)
 
 TokenGS predicts 3D Gaussians with a self-supervised rendering objective. An encoder–decoder stacks learnable Gaussian tokens so the number of primitives is not tied to image resolution or view count.
 
