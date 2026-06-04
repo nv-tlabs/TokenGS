@@ -24,6 +24,7 @@ from torch.nn.attention.flex_attention import flex_attention as flex_attn_func
 # Flex-attention: larger cache limit avoids recompiles when compiled kwargs change; DDP + dynamo can break on HOO.
 torch._dynamo.config.cache_size_limit = 1000
 torch._dynamo.config.optimize_ddp = False
+torch._dynamo.config.suppress_errors = True
 flex_attn_func_compiled = torch.compile(flex_attn_func)
 
 

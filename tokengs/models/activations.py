@@ -38,7 +38,7 @@ class BaseActivationHead(nn.Module, ABC):
         super().__init__()
         self.opt = opt
 
-        self.num_gaussians_per_token = self.opt.patch_size**2
+        self.num_gaussians_per_token = self.opt.dec_patch_size**2
 
         scale_cap = self.opt.gaussian_scale_cap
         self.scale_shift = 1 - math.log(scale_cap)
@@ -83,11 +83,18 @@ class ClipActivationHead(BaseActivationHead):
         # Single linear layer (deconv) for all components
         self.deconv = nn.Linear(
             self.opt.enc_embed_dim,
-            self.output_dims * self.opt.patch_size * self.opt.patch_size,
+            self.output_dims * self.opt.dec_patch_size * self.opt.dec_patch_size,
             bias=True,
         )
 
         self._init_weights(self.deconv)
+        if self.opt.clip_head_z_init is not None:
+            bias_val = math.log(1.0 + self.opt.clip_head_z_init)
+            with torch.no_grad():
+                self.deconv.bias.view(
+                    self.opt.dec_patch_size * self.opt.dec_patch_size,
+                    self.output_dims,
+                )[:, 2].fill_(bias_val)
 
         # Mark parameters to exclude from weight decay
         for param in self.parameters():
@@ -96,7 +103,7 @@ class ClipActivationHead(BaseActivationHead):
     def _init_weights(self, m):
         """Initialize deconv weights"""
         if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=0.002)
+            trunc_normal_(m.weight, std=self.opt.clip_head_readout_std)
             if m.bias is not None:
                 m.bias.data.zero_()
 
@@ -115,7 +122,7 @@ class ClipActivationHead(BaseActivationHead):
 
     def opacity_act(self, x: torch.Tensor) -> torch.Tensor:
         """Opacity activation with hard clipping"""
-        return torch.sigmoid(x - 2.0)
+        return torch.sigmoid(x - self.opt.opacity_bias)
 
     def rot_act(self, x: torch.Tensor) -> torch.Tensor:
         """Rotation normalization"""
@@ -150,7 +157,7 @@ class ClipActivationHead(BaseActivationHead):
 
         x = x.squeeze(-1).permute(0, 2, 1)  # B, N, C
         x = self.deconv(x)  # [B, N, output_dims * P * P]
-        x = rearrange(x, "b n (p c) -> b c (n p)", p=self.opt.patch_size**2)
+        x = rearrange(x, "b n (p c) -> b c (n p)", p=self.opt.dec_patch_size**2)
 
         x = x.reshape(B, self.output_dims, -1)  # B, output_dims, N * P * P
         x = x.permute(0, 2, 1).contiguous()  # B, N * P * P, output_dims

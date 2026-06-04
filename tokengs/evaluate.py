@@ -91,6 +91,39 @@ def _copy_matching_checkpoint(model: nn.Module, ckpt: dict[str, Any], log) -> No
             )
 
 
+def _copy_checkpoint_strict(model: nn.Module, ckpt: dict[str, Any]) -> None:
+    state_dict = model.state_dict()
+    unexpected = []
+    mismatched = []
+    loaded = set()
+
+    for k, v in ckpt.items():
+        if "lpips_loss" in k:
+            continue
+        if k not in state_dict:
+            unexpected.append(k)
+            continue
+        if state_dict[k].shape != v.shape:
+            mismatched.append((k, tuple(v.shape), tuple(state_dict[k].shape)))
+            continue
+        state_dict[k].copy_(v)
+        loaded.add(k)
+
+    missing = [
+        k for k in state_dict.keys()
+        if "lpips_loss" not in k and k not in loaded
+    ]
+    if unexpected or mismatched or missing:
+        msg = ["Checkpoint does not match model preset."]
+        if unexpected:
+            msg.append(f"Unexpected keys ({len(unexpected)}): {unexpected[:20]}")
+        if mismatched:
+            msg.append(f"Mismatched shapes ({len(mismatched)}): {mismatched[:20]}")
+        if missing:
+            msg.append(f"Missing keys ({len(missing)}): {missing[:20]}")
+        raise RuntimeError("\n".join(msg))
+
+
 def _cuda_sync() -> None:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -112,7 +145,8 @@ def main() -> None:
     opt = _load_options(accelerator, config_path)
     opt.use_input_supervision = False
 
-    accelerator.print(f"[INFO] {'' if opt.use_ttt_for_eval else 'not '}using TTT for evaluation")
+    ttt_status = f"using {opt.ttt_mode} TTT" if opt.use_ttt_for_eval else "not using TTT"
+    accelerator.print(f"[INFO] {ttt_status} for evaluation")
 
     model = model_registry[opt.model_type](opt)
     if opt.resume is None or opt.resume == "None":
@@ -120,7 +154,10 @@ def main() -> None:
 
     accelerator.print(f"[INFO] loading model from {opt.resume=}")
     ckpt = _load_checkpoint_state_dict(opt.resume)
-    _copy_matching_checkpoint(model, ckpt, accelerator.print)
+    if opt.strict_checkpoint_loading:
+        _copy_checkpoint_strict(model, ckpt)
+    else:
+        _copy_matching_checkpoint(model, ckpt, accelerator.print)
     accelerator.print("[INFO] Model loaded!")
 
     _train_dl, test_dataloader, _, _ = get_multi_dataloader(opt, accelerator)

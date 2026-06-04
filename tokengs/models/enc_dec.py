@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -167,14 +165,55 @@ class EncDecBackbone(nn.Module):
             ]
         )
 
-        self.encoder_norm = nn.LayerNorm(self.opt.enc_embed_dim)
+        self.use_multiscale = self.opt.use_multiscale_encoder
+        self.use_latent_bottleneck = self.opt.use_latent_bottleneck
 
-        self.kv_proj = nn.Linear(
-            self.opt.enc_embed_dim, self.opt.enc_embed_dim * 2, bias=True
-        )
+        if self.use_multiscale:
+            self.multiscale_layers = self.opt.multiscale_encoder_layers
+            self.multiscale_norms = nn.ModuleList(
+                [nn.LayerNorm(self.opt.enc_embed_dim) for _ in self.multiscale_layers]
+            )
+            encoder_feature_dim = self.opt.enc_embed_dim * len(self.multiscale_layers)
+        else:
+            self.encoder_norm = nn.LayerNorm(self.opt.enc_embed_dim)
+            encoder_feature_dim = self.opt.enc_embed_dim
 
-        # normalize the k projection, q are normalized in the attention block
+        if not self.use_latent_bottleneck:
+            self.kv_proj = nn.Linear(
+                encoder_feature_dim, self.opt.enc_embed_dim * 2, bias=True
+            )
+
         self.k_proj_norm = nn.LayerNorm(self.opt.enc_embed_dim // self.opt.enc_num_heads)
+
+        if self.use_latent_bottleneck:
+            self.latents = nn.Parameter(
+                torch.randn(self.opt.num_latents, self.opt.enc_embed_dim) * 0.02
+            )
+            self.latents._no_weight_decay = True
+
+            self.latent_feature_kv_proj = nn.Linear(
+                encoder_feature_dim, self.opt.enc_embed_dim * 2, bias=True
+            )
+            self.latent_feature_k_norm = nn.LayerNorm(
+                self.opt.enc_embed_dim // self.opt.enc_num_heads
+            )
+            self.latent_blocks = nn.ModuleList(
+                [
+                    DecoderBlock(
+                        self.opt.enc_embed_dim,
+                        self.opt.enc_num_heads,
+                        self.opt.mlp_ratio,
+                        qkv_bias=True,
+                        ffn_bias=True,
+                        init_values=0.01,
+                        qk_norm=True,
+                    )
+                    for _ in range(self.opt.latent_cross_attn_depth)
+                ]
+            )
+            self.latent_kv_proj = nn.Linear(
+                self.opt.enc_embed_dim, self.opt.enc_embed_dim * 2, bias=True
+            )
 
         if self.opt.num_dynamic_gs_tokens > 0:
             block_ids = [0] * self.opt.num_gs_tokens + [1] * self.opt.num_dynamic_gs_tokens
@@ -184,12 +223,13 @@ class EncDecBackbone(nn.Module):
                 persistent=False,
             )
 
-            def block_causal_score_mod(score, b, h, q_idx, kv_idx, block_ids_tensor: torch.Tensor):
+            def block_causal_score_mod(score, b, h, q_idx, kv_idx):
+                block_ids_tensor = self._decoder_block_ids
                 same_block_mask = block_ids_tensor[q_idx] == block_ids_tensor[kv_idx]
                 causal_mask = q_idx >= kv_idx
                 return torch.where(same_block_mask | causal_mask, score, float("-inf"))
 
-            score_mod = partial(block_causal_score_mod, block_ids_tensor=self._decoder_block_ids)
+            score_mod = block_causal_score_mod
         else:
             score_mod = None
 
@@ -201,7 +241,11 @@ class EncDecBackbone(nn.Module):
                     self.opt.mlp_ratio,
                     qkv_bias=True,
                     ffn_bias=True,
-                    init_values=5e-3 * self.opt.gs_token_std,
+                    init_values=(
+                        self.opt.dec_init_values
+                        if self.opt.dec_init_values is not None
+                        else 5e-3 * self.opt.gs_token_std
+                    ),
                     qk_norm=True,
                     attn_score_mod=score_mod,
                 )
@@ -209,11 +253,21 @@ class EncDecBackbone(nn.Module):
             ]
         )
 
-    def _encode_to_kv(
+    def _encode_features(self, image_features: torch.Tensor) -> torch.Tensor:
+        if self.use_multiscale:
+            x = image_features
+            features = []
+            for i, block in enumerate(self.encoder):
+                x = block(x)
+                if i in self.multiscale_layers:
+                    features.append(self.multiscale_norms[len(features)](x))
+            return torch.cat(features, dim=-1)
+        image_features = self.encoder(image_features)
+        return self.encoder_norm(image_features)
+
+    def _features_to_kv(
         self, image_features: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        image_features = self.encoder(image_features)
-        image_features = self.encoder_norm(image_features)
         image_feature_keys, image_feature_values = rearrange(
             self.kv_proj(image_features),
             "b n (kv h c) -> kv b h n c",
@@ -222,3 +276,46 @@ class EncDecBackbone(nn.Module):
         )
         image_feature_keys = self.k_proj_norm(image_feature_keys)
         return image_feature_keys, image_feature_values
+
+    def _features_to_scene_latents(
+        self, image_features: torch.Tensor
+    ) -> torch.Tensor:
+        feat_keys, feat_values = rearrange(
+            self.latent_feature_kv_proj(image_features),
+            "b n (kv h c) -> kv b h n c",
+            kv=2,
+            h=self.opt.enc_num_heads,
+        )
+        feat_keys = self.latent_feature_k_norm(feat_keys)
+
+        latents = self.latents.unsqueeze(0).expand(image_features.shape[0], -1, -1)
+        for block in self.latent_blocks:
+            latents = block(gs_tokens=latents, keys=feat_keys, values=feat_values)
+
+        return latents
+
+    def _latents_to_kv(
+        self, latents: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        latent_keys, latent_values = rearrange(
+            self.latent_kv_proj(latents),
+            "b n (kv h c) -> kv b h n c",
+            kv=2,
+            h=self.opt.enc_num_heads,
+        )
+        latent_keys = self.k_proj_norm(latent_keys)
+        return latent_keys, latent_values
+
+    def _features_to_kv_via_latents(
+        self, image_features: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        latents = self._features_to_scene_latents(image_features)
+        return self._latents_to_kv(latents)
+
+    def _encode_to_kv(
+        self, image_features: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        image_features = self._encode_features(image_features)
+        if self.use_latent_bottleneck:
+            return self._features_to_kv_via_latents(image_features)
+        return self._features_to_kv(image_features)

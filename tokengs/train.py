@@ -120,6 +120,9 @@ def load_model_checkpoint(opt, model, accelerator, epoch_start):
 
     if opt.init_tokens_from_existing and epoch_start == 0:
         _initialize_tokens_from_existing(ckpt, state_dict, accelerator)
+
+    if opt.init_latents_from_existing and epoch_start == 0:
+        _initialize_latents_from_existing(ckpt, state_dict, accelerator)
     
     if opt.init_dynamic_tokens_from_static and epoch_start == 0 and 'gs_tokens' in ckpt:
         _initialize_dynamic_tokens_from_static(ckpt, state_dict, accelerator)
@@ -129,7 +132,7 @@ def _initialize_tokens_from_existing(ckpt, state_dict, accelerator):
     """Initialize tokens from existing checkpoint."""
     with torch.no_grad():
         for token_type in ['gs_tokens', 'gs_tokens_dynamic']:
-            if token_type not in ckpt:
+            if token_type not in ckpt or token_type not in state_dict:
                 continue
             pretrained_tokens = ckpt[token_type]
             current_tokens = state_dict[token_type]    
@@ -154,6 +157,35 @@ def _initialize_tokens_from_existing(ckpt, state_dict, accelerator):
                 expanded = pretrained_tokens.repeat((repeat_factor, 1))[:extra_tokens.shape[0]]
                 noise = 0.01 * torch.randn_like(expanded)   # small perturbation
                 extra_tokens.copy_(expanded + noise)
+
+
+def _initialize_latents_from_existing(ckpt, state_dict, accelerator):
+    """Initialize latent bottleneck tokens from an existing latent checkpoint."""
+    key = "enc_dec_backbone.latents"
+    if key not in ckpt or key not in state_dict:
+        return
+
+    with torch.no_grad():
+        pretrained_latents = ckpt[key]
+        current_latents = state_dict[key]
+        N_old = pretrained_latents.shape[0]
+        N_new = current_latents.shape[0]
+
+        if N_new != N_old:
+            accelerator.print(
+                f"[INFO] Initializing latent bottleneck from checkpoint, N_old: {N_old}, N_new: {N_new}"
+            )
+
+        if N_new <= N_old:
+            idx = torch.linspace(0, N_old - 1, N_new).long()
+            current_latents.copy_(pretrained_latents[idx])
+        else:
+            current_latents[:N_old].copy_(pretrained_latents)
+            extra_latents = current_latents[N_old:]
+            repeat_factor = (extra_latents.shape[0] + N_old - 1) // N_old
+            expanded = pretrained_latents.repeat((repeat_factor, 1))[: extra_latents.shape[0]]
+            noise = 0.01 * torch.randn_like(expanded)
+            extra_latents.copy_(expanded + noise)
 
 
 def _initialize_dynamic_tokens_from_static(ckpt, state_dict, accelerator):
@@ -275,26 +307,41 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
         """Execute a single training step and return metrics."""
         optimizer.zero_grad()
 
+        global_step_for_aux = epoch * iters_per_epoch + iteration
+        unwrapped_model = accelerator.unwrap_model(model)
+        if hasattr(unwrapped_model, "compute_lambda_dyn_aux_eff"):
+            unwrapped_model.lambda_dyn_aux_eff = unwrapped_model.compute_lambda_dyn_aux_eff(
+                global_step_for_aux,
+                opt,
+            )
+
         out = model(data)
         loss = out['loss']
         psnr = out['psnr']
-        accelerator.backward(loss)
+        backward_loss = out.get('backward_loss', loss)
+        accelerator.backward(backward_loss)
 
         if accelerator.sync_gradients:
             accelerator.clip_grad_norm_(model.parameters(), opt.gradient_clip)
 
         optimizer.step()
-        scheduler.step()
+        if accelerator.sync_gradients:
+            scheduler.step()
 
         loss_value = loss.detach()
         psnr_value = psnr.detach()
         loss_value_detailed = {
-            'loss_mse': out['loss_mse'].detach(),
+            'loss_rgb': out['loss_rgb'].detach(),
         }
         if 'loss_ssim' in out:
             loss_value_detailed['loss_ssim'] = out['loss_ssim'].detach()
         if 'loss_visibility' in out:
             loss_value_detailed['loss_visibility'] = out['loss_visibility'].detach()
+        if 'loss_opacity' in out:
+            loss_value_detailed['loss_opacity'] = out['loss_opacity'].detach()
+        for key in ('loss_dyn_aux', 'psnr_dyn_aux', 'lambda_dyn_aux_eff'):
+            if key in out:
+                loss_value_detailed[key] = out[key].detach()
         
         if should_log_images:
             log_training_images(opt, accelerator, data, out, epoch, iteration, writer, is_train=True)

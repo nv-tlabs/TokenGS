@@ -23,6 +23,15 @@ import torch
 from tokengs.options import Options
 
 
+IndexSpec = int | slice
+
+
+def _preserve_dim(index: IndexSpec) -> slice:
+    if isinstance(index, int):
+        return slice(index, index + 1)
+    return index
+
+
 @dataclass
 class ModelInputEncoder:
     """Input data for the encoder (input views)"""
@@ -62,6 +71,24 @@ class ModelInputDecoder:
     # Camera parameters for rendering (output views)
     cam_view: Optional[torch.Tensor] = None  # [B, V_out, 4, 4] - Camera view matrices for rendering
     intrinsics: Optional[torch.Tensor] = None  # [B, V_out, 4] - Intrinsics for rendering
+
+    def select_batch(self, scenes: IndexSpec, views: Optional[IndexSpec] = None) -> ModelInputDecoder:
+        scene_slice = _preserve_dim(scenes)
+        view_slice = _preserve_dim(views) if views is not None else slice(None)
+        return type(self)(
+            time_embedding_target=(
+                None if self.time_embedding_target is None else self.time_embedding_target[scene_slice]
+            ),
+            cam_view=None if self.cam_view is None else self.cam_view[scene_slice, view_slice],
+            intrinsics=None if self.intrinsics is None else self.intrinsics[scene_slice, view_slice],
+        )
+
+
+@dataclass
+class Reconstruction:
+    """Model prediction ready for rendering."""
+    gaussians: torch.Tensor  # [B, N, 14] - activated Gaussian parameters
+    background_color: torch.Tensor  # [3] - RGB background color
 
 
 @dataclass
@@ -149,6 +176,17 @@ class ModelSupervision:
 
     def __post_init__(self):
         assert (self.rays_os is not None) == (self.rays_ds is not None), "rays_os and rays_ds must be either both None or both not None"
+
+    def select_batch(self, scenes: IndexSpec, views: Optional[IndexSpec] = None) -> ModelSupervision:
+        scene_slice = _preserve_dim(scenes)
+        view_slice = _preserve_dim(views) if views is not None else slice(None)
+        return type(self)(
+            images_output=self.images_output[scene_slice, view_slice],
+            masks_output=self.masks_output[scene_slice, view_slice],
+            has_mask=self.has_mask[scene_slice],
+            rays_os=None if self.rays_os is None else self.rays_os[scene_slice, view_slice],
+            rays_ds=None if self.rays_ds is None else self.rays_ds[scene_slice, view_slice],
+        )
 
 
 def split_data(batch: dict, opt: Options) -> tuple[ModelInput, ModelSupervision]:

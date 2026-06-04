@@ -18,10 +18,10 @@ TokenGS: Encoder-decoder model for 3D scene reconstruction from sparse views.
 """
 
 from typing import Optional
+from functools import partial
 import torch
 import torch.nn as nn
 from einops import rearrange
-from functools import partial
 
 from lpips import LPIPS
 
@@ -32,13 +32,19 @@ from tokengs.models.input_types import (
     ModelInputDecoder,
     ModelInputEncoder,
     ModelSupervision,
+    Reconstruction,
     split_data,
 )
 from .attention import PatchEmbed
 from tokengs.models.enc_dec import EncDecBackbone
 from tokengs.rendering.gs import GaussianRenderer
 from tokengs.models.activations import ClipActivationHead
-from tokengs.models.losses import compute_tokengs_loss
+from tokengs.models.losses import (
+    compute_loss_from_renders,
+    compute_tokengs_loss,
+    compute_visibility_loss_from_means2d,
+    project_gaussian_means2d,
+)
 from tokengs.utils.training import freeze_model_parameters
 
 
@@ -109,10 +115,16 @@ class TokenGS(nn.Module):
         # Activation head (always clip)
         self.activation_head = ClipActivationHead(opt)
 
+        # Stamped by the trainer each step when dynamic auxiliary loss uses a schedule.
+        self.lambda_dyn_aux_eff = float(opt.lambda_dyn_aux)
+
         # LPIPS loss
+        self.lpips_loss: Optional[LPIPS] = None
         if self.opt.lambda_lpips > 0:
             self.lpips_loss = LPIPS(net='vgg')
             self.lpips_loss.requires_grad_(False)
+        else:
+            self.lpips_loss = None
 
         # Learnable GS tokens
         self.gs_tokens = nn.Parameter(
@@ -140,16 +152,13 @@ class TokenGS(nn.Module):
             return torch.ones(3, dtype=dtype, device=device) * 0.5
         raise ValueError(f"Invalid background color: {self.opt.bg_color}")
 
-    def forward_encoder(self, encoder_input: ModelInputEncoder) -> EncoderLatent:
-        """
-        Encode input views into latent representation (keys and values for cross-attention).
-        
-        Args:
-            encoder_input: ModelInputEncoder containing input view data (only input views)
-            
-        Returns:
-            EncoderLatent containing keys and values for cross-attention
-        """
+    def _reconstruction_from_gaussians(self, gaussians: torch.Tensor) -> Reconstruction:
+        return Reconstruction(
+            gaussians=gaussians,
+            background_color=self._background_color(gaussians.dtype, gaussians.device),
+        )
+
+    def _embed_encoder_input(self, encoder_input: ModelInputEncoder) -> torch.Tensor:
         B, V, _, H, W = encoder_input.images_rgb.shape
         height = int(H // self.opt.patch_size)
         width = int(W // self.opt.patch_size)
@@ -176,10 +185,41 @@ class TokenGS(nn.Module):
             x_time_emb = self.patch_time_embed(time_emb_reshaped)  # (B*V, N, C)
             x = x + x_time_emb.reshape(B, V * (height * width), -1)  # Reshape to match x: (B, V*N, C)
 
+        return x
+
+    def forward_encoder(self, encoder_input: ModelInputEncoder) -> EncoderLatent:
+        """
+        Encode input views into latent representation (keys and values for cross-attention).
+
+        Args:
+            encoder_input: ModelInputEncoder containing input view data (only input views)
+
+        Returns:
+            EncoderLatent containing keys and values for cross-attention
+        """
+        x = self._embed_encoder_input(encoder_input)
+
         # Run encoder on joint views and produce keys/values
         # x shape: (B, V*N, C) where all views are processed jointly
         image_feature_keys, image_feature_values = self.enc_dec_backbone._encode_to_kv(x)
         
+        return EncoderLatent(
+            keys=image_feature_keys,
+            values=image_feature_values,
+        )
+
+    def forward_encoder_to_scene_latents(self, encoder_input: ModelInputEncoder) -> torch.Tensor:
+        """Encode input views to the scene latent bottleneck output."""
+        if not self.opt.use_latent_bottleneck:
+            raise ValueError("scene-latent tuning requires use_latent_bottleneck=True")
+
+        x = self._embed_encoder_input(encoder_input)
+        image_features = self.enc_dec_backbone._encode_features(x)
+        return self.enc_dec_backbone._features_to_scene_latents(image_features)
+
+    def encoder_latent_from_scene_latents(self, scene_latents: torch.Tensor) -> EncoderLatent:
+        """Convert scene latent bottleneck tokens to decoder attention keys and values."""
+        image_feature_keys, image_feature_values = self.enc_dec_backbone._latents_to_kv(scene_latents)
         return EncoderLatent(
             keys=image_feature_keys,
             values=image_feature_values,
@@ -197,9 +237,9 @@ class TokenGS(nn.Module):
         Returns:
             GS tokens with shape [B, num_gs_tokens, C]
         """
-        batch_gs_tokens = self.gs_tokens.unsqueeze(0).repeat(batch_size, 1, 1)
+        batch_gs_tokens = self.gs_tokens.unsqueeze(0).expand(batch_size, -1, -1).clone()
         if self.opt.num_dynamic_gs_tokens > 0:
-            dyn = self.gs_tokens_dynamic.unsqueeze(0).repeat(batch_size, 1, 1)
+            dyn = self.gs_tokens_dynamic.unsqueeze(0).expand(batch_size, -1, -1).clone()
             batch_gs_tokens = torch.cat([batch_gs_tokens, dyn], dim=1)
         return batch_gs_tokens
     
@@ -240,6 +280,19 @@ class TokenGS(nn.Module):
             gs_tokens = gs_tokens + x_time_emb_tgt
         
         return gs_tokens
+
+    @staticmethod
+    def compute_lambda_dyn_aux_eff(step: int, opt) -> float:
+        """Schedule the auxiliary dynamic-only loss weight."""
+        base = float(opt.lambda_dyn_aux)
+        if base <= 0:
+            return 0.0
+        if opt.lambda_dyn_aux_decay_steps <= 0:
+            return base
+        if step <= opt.lambda_dyn_aux_warmup_steps:
+            return base
+        frac = min(1.0, (step - opt.lambda_dyn_aux_warmup_steps) / max(1, opt.lambda_dyn_aux_decay_steps))
+        return base + frac * (float(opt.lambda_dyn_aux_min) - base)
 
     def forward_decoder(
         self, 
@@ -283,9 +336,9 @@ class TokenGS(nn.Module):
 
         return gaussians
 
-    def forward_gaussians(self, model_input: ModelInput) -> torch.Tensor:
+    def forward_reconstruction(self, model_input: ModelInput) -> Reconstruction:
         """
-        Generate Gaussians from model input.
+        Generate a reconstruction from model input.
         This is a convenience method that combines encoding and decoding.
         For test-time training, use forward_encoder(), get_gs_tokens(), and forward_decoder() separately.
         
@@ -293,7 +346,7 @@ class TokenGS(nn.Module):
             model_input: ModelInput containing all necessary input data
             
         Returns:
-            Gaussians tensor [B, N, 14] where N is the number of Gaussians
+            Reconstruction containing Gaussians [B, N, 14] and background color [3]
         """
         # Encode input views
         encoder_latent = self.forward_encoder(model_input.encoder)
@@ -301,43 +354,256 @@ class TokenGS(nn.Module):
         # Decode to Gaussians (time conditioning is applied inside forward_decoder)
         gaussians = self.forward_decoder(encoder_latent, model_input.decoder)
         
-        return gaussians
+        return self._reconstruction_from_gaussians(gaussians)
 
-    def render_gaussians(self, gaussians: torch.Tensor, decoder_input: ModelInputDecoder) -> dict:
+    def forward_gaussians(self, model_input: ModelInput) -> torch.Tensor:
         """
-        Render Gaussians to images.
-        
+        Generate Gaussians from model input.
+        This compatibility method returns only the raw Gaussian tensor.
+
         Args:
-            gaussians: Gaussian parameters [B, N, 14]
-            decoder_input: ModelInputDecoder containing camera parameters
-            
+            model_input: ModelInput containing all necessary input data
+
+        Returns:
+            Gaussians tensor [B, N, 14] where N is the number of Gaussians
+        """
+        return self.forward_reconstruction(model_input).gaussians
+
+    def render_reconstruction(
+        self,
+        reconstruction: Reconstruction,
+        decoder_input: ModelInputDecoder,
+    ) -> dict:
+        """
+        Render a reconstruction to images.
+
+        Args:
+            reconstruction: Model prediction containing Gaussian parameters and background color
+            decoder_input: Decoder input containing camera view matrices and intrinsics
+
         Returns:
             Dictionary with 'images_pred', 'alphas_pred', etc.
         """
-        bg_color = self._background_color(gaussians.dtype, gaussians.device)
-        results = self.gs.render(
-            gaussians,
+        if decoder_input.cam_view is None:
+            raise ValueError("decoder_input.cam_view is required for rendering")
+        if decoder_input.intrinsics is None:
+            raise ValueError("decoder_input.intrinsics is required for rendering")
+
+        return self.gs.render(
+            reconstruction.gaussians,
             decoder_input.cam_view,
-            bg_color=bg_color,
+            bg_color=reconstruction.background_color,
             intrinsics=decoder_input.intrinsics,
         )
-        return results
+
+    def render_gaussians(
+        self,
+        gaussians: torch.Tensor,
+        decoder_input_or_cam_view: ModelInputDecoder | torch.Tensor,
+        intrinsics: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """
+        Render Gaussians to images.
+
+        Args:
+            gaussians: Gaussian parameters [B, N, 14]
+            decoder_input_or_cam_view: Decoder input or camera view matrices [B, V, 4, 4]
+            intrinsics: Intrinsics [B, V, 4], required when camera views are passed directly
+
+        Returns:
+            Dictionary with 'images_pred', 'alphas_pred', etc.
+        """
+        if isinstance(decoder_input_or_cam_view, ModelInputDecoder):
+            decoder_input = decoder_input_or_cam_view
+        else:
+            decoder_input = ModelInputDecoder(
+                cam_view=decoder_input_or_cam_view,
+                intrinsics=intrinsics,
+            )
+        return self.render_reconstruction(
+            self._reconstruction_from_gaussians(gaussians),
+            decoder_input,
+        )
 
     def compute_loss(
         self,
-        gaussians: torch.Tensor,
+        reconstruction: Reconstruction,
         decoder_input: ModelInputDecoder,
         supervision: ModelSupervision,
     ) -> dict:
-        render_results = self.render_gaussians(gaussians, decoder_input)
-        return compute_tokengs_loss(
+        render_results = self.render_reconstruction(reconstruction, decoder_input)
+        results = compute_tokengs_loss(
             opt=self.opt,
             img_size=self.img_size,
             render_results=render_results,
             supervision=supervision,
-            gaussians_xyz=gaussians[..., :3],
-            lpips_loss=getattr(self, "lpips_loss", None),
+            decoder_input=decoder_input,
+            gaussians=reconstruction.gaussians,
+            lpips_loss=self.lpips_loss,
         )
+
+        lambda_dyn_aux = float(getattr(self, "lambda_dyn_aux_eff", self.opt.lambda_dyn_aux))
+        if (
+            lambda_dyn_aux > 0
+            and self.opt.num_dynamic_gs_tokens > 0
+            and self.opt.num_gs_tokens > 0
+        ):
+            P2 = self.opt.dec_patch_size * self.opt.dec_patch_size
+            n_dyn_gs = self.opt.num_dynamic_gs_tokens * P2
+            gaussians_dyn = reconstruction.gaussians[:, -n_dyn_gs:].contiguous()
+            dyn_render = self.render_gaussians(gaussians_dyn, decoder_input)
+            dyn_results = compute_tokengs_loss(
+                opt=self.opt,
+                img_size=self.img_size,
+                render_results=dyn_render,
+                supervision=supervision,
+                decoder_input=decoder_input,
+                gaussians=gaussians_dyn,
+                lpips_loss=self.lpips_loss,
+            )
+            results["loss_dyn_aux"] = dyn_results["loss"].detach()
+            results["psnr_dyn_aux"] = dyn_results["psnr"].detach()
+            results["lambda_dyn_aux_eff"] = torch.tensor(lambda_dyn_aux, device=reconstruction.gaussians.device)
+            results["loss"] = results["loss"] + lambda_dyn_aux * dyn_results["loss"]
+
+        return results
+
+    def _mean_of_grads_chunk_sizes(self, batch_size: int, num_views: int) -> tuple[int, int]:
+        scene_chunk_size = min(self.opt.mean_of_grads_scene_chunk_size, batch_size)
+        if self.opt.mean_of_grads_view_chunk_size is None:
+            view_chunk_size = num_views if self.opt.mean_of_grads == "per-scene" else 1
+        else:
+            view_chunk_size = self.opt.mean_of_grads_view_chunk_size
+        return scene_chunk_size, min(view_chunk_size, num_views)
+
+    def compute_loss_mean_of_grads(
+        self,
+        reconstruction: Reconstruction,
+        decoder_input: ModelInputDecoder,
+        supervision: ModelSupervision,
+    ) -> dict:
+        if self.opt.mean_of_grads not in ("per-scene", "per-view"):
+            raise ValueError(f"Invalid mean_of_grads mode: {self.opt.mean_of_grads}")
+        if decoder_input.cam_view is None:
+            raise ValueError("decoder_input.cam_view is required for rendering")
+        if decoder_input.intrinsics is None:
+            raise ValueError("decoder_input.intrinsics is required for rendering")
+
+        gaussians = reconstruction.gaussians
+        batch_size = gaussians.shape[0]
+        num_views = decoder_input.cam_view.shape[1]
+        scene_chunk_size, view_chunk_size = self._mean_of_grads_chunk_sizes(batch_size, num_views)
+        gaussians_leaf = gaussians.detach().requires_grad_(True)
+        grad_accum = torch.zeros_like(gaussians_leaf)
+
+        per_scene_chunks: dict[str, list[torch.Tensor]] = {}
+        render_chunks: dict[str, list[torch.Tensor]] = {}
+        raw_loss_mask_chunks: list[torch.Tensor] = []
+        render_keys = {"images_pred", "alphas_pred", "depths_pred", "images_output"}
+        valid_mask_count = supervision.has_mask.float().sum()
+        per_scene_loss = partial(compute_loss_from_renders, self.opt, self.img_size, lpips_loss=self.lpips_loss)
+
+        for scene_start in range(0, batch_size, scene_chunk_size):
+            scene_end = min(scene_start + scene_chunk_size, batch_size)
+            gaussians_scene = gaussians_leaf[scene_start:scene_end]
+            reconstruction_scene = Reconstruction(
+                gaussians=gaussians_scene,
+                background_color=reconstruction.background_color,
+            )
+
+            scene_results: dict[str, torch.Tensor] = {}
+            scene_render_chunks: dict[str, list[torch.Tensor]] = {}
+
+            for view_start in range(0, num_views, view_chunk_size):
+                view_end = min(view_start + view_chunk_size, num_views)
+                view_count = view_end - view_start
+                view_weight = view_count / num_views
+
+                scene_slice = slice(scene_start, scene_end)
+                view_slice = slice(view_start, view_end)
+                decoder_chunk = decoder_input.select_batch(scene_slice, view_slice)
+                supervision_chunk = supervision.select_batch(scene_slice, view_slice)
+                render_chunk = self.render_reconstruction(reconstruction_scene, decoder_chunk)
+
+                out_chunk = torch.vmap(per_scene_loss, in_dims=(0,) * 5)(
+                    render_chunk["images_pred"].unsqueeze(1),
+                    render_chunk["alphas_pred"].unsqueeze(1),
+                    supervision_chunk.images_output.unsqueeze(1),
+                    supervision_chunk.masks_output.unsqueeze(1),
+                    supervision_chunk.has_mask.unsqueeze(1),
+                )
+                if "loss_lpips" in out_chunk:
+                    out_chunk["loss"] = out_chunk["loss"] + float(self.opt.lambda_lpips) * out_chunk["loss_lpips"]
+
+                scaled_loss = out_chunk["loss"].sum() * view_weight / batch_size
+                grad_chunk = torch.autograd.grad(
+                    scaled_loss,
+                    reconstruction_scene.gaussians,
+                    retain_graph=False,
+                    create_graph=False,
+                )[0]
+                grad_accum[scene_start:scene_end] += grad_chunk
+
+                for key, value in out_chunk.items():
+                    if torch.is_tensor(value):
+                        weighted = value.detach() * view_weight
+                        scene_results[key] = scene_results.get(key, torch.zeros_like(weighted)) + weighted
+                for key in render_keys - {"images_output"}:
+                    scene_render_chunks.setdefault(key, []).append(render_chunk[key].detach())
+                scene_render_chunks.setdefault("images_output", []).append(supervision_chunk.images_output.detach())
+
+            if self.opt.lambda_visibility > 0:
+                decoder_scene = decoder_input.select_batch(slice(scene_start, scene_end), slice(0, num_views))
+                means2d_pred = project_gaussian_means2d(gaussians_scene[..., :3], decoder_scene.cam_view, decoder_scene.intrinsics)
+                loss_visibility = compute_visibility_loss_from_means2d(self.opt, self.img_size, means2d_pred)
+                scaled_visibility = self.opt.lambda_visibility * loss_visibility.sum() / batch_size
+                grad_visibility = torch.autograd.grad(
+                    scaled_visibility,
+                    reconstruction_scene.gaussians,
+                    retain_graph=False,
+                    create_graph=False,
+                )[0]
+                grad_accum[scene_start:scene_end] += grad_visibility
+                scene_results["loss_visibility"] = loss_visibility.detach()
+                scene_results["loss"] = scene_results["loss"] + self.opt.lambda_visibility * loss_visibility.detach()
+
+            for key, value in scene_results.items():
+                if key == "loss_mask":
+                    raw_loss_mask_chunks.append(value * (supervision.has_mask[scene_start:scene_end].float() + 1e-6))
+                else:
+                    per_scene_chunks.setdefault(f"{key}_per_scene", []).append(value)
+
+            for key, chunks in scene_render_chunks.items():
+                render_chunks.setdefault(key, []).append(torch.cat(chunks, dim=1))
+
+        results = {key: torch.cat(chunks, dim=0) for key, chunks in per_scene_chunks.items()}
+        for key, value in list(results.items()):
+            if key.endswith("_per_scene") and key != "loss_mask_per_scene":
+                results[key.removesuffix("_per_scene")] = value.mean()
+        results.update({key: torch.cat(chunks, dim=0) for key, chunks in render_chunks.items()})
+
+        if raw_loss_mask_chunks:
+            loss_mask_per_scene = torch.cat(raw_loss_mask_chunks, dim=0) / (valid_mask_count + 1e-6)
+            results["loss_mask_per_scene"] = loss_mask_per_scene
+            results["loss_mask"] = loss_mask_per_scene.mean()
+
+        if self.opt.lambda_opacity > 0:
+            opacity = gaussians_leaf[..., 3:4]
+            loss_opacity_per_scene = -torch.log(opacity + 1e-6).mean(dim=(1, 2))
+            scaled_opacity = self.opt.lambda_opacity * loss_opacity_per_scene.sum() / batch_size
+            grad_opacity = torch.autograd.grad(
+                scaled_opacity,
+                gaussians_leaf,
+                retain_graph=False,
+                create_graph=False,
+            )[0]
+            grad_accum += grad_opacity
+            results["loss_opacity_per_scene"] = loss_opacity_per_scene.detach()
+            results["loss_opacity"] = loss_opacity_per_scene.detach().mean()
+            results["loss"] = results["loss"] + self.opt.lambda_opacity * results["loss_opacity"]
+
+        results["backward_loss"] = (gaussians * grad_accum.detach()).sum()
+        return results
 
     def forward(self, data, skip_loss=False):
         """
@@ -353,21 +619,30 @@ class TokenGS(nn.Module):
         # Split data into structured input and supervision
         model_input, supervision = split_data(data, self.opt)
 
-        # Generate Gaussians from input
+        # Generate reconstruction from input
         if self.opt.use_ttt_for_eval:
             gaussians = self.forward_ttt(model_input, n_steps=self.opt.ttt_n_steps, lr=self.opt.ttt_lr)  # [B, N, 14]
+            reconstruction = self._reconstruction_from_gaussians(gaussians)
         else:
-            gaussians = self.forward_gaussians(model_input)  # [B, N, 14]
+            reconstruction = self.forward_reconstruction(model_input)
+
+        results = {"gaussians": reconstruction.gaussians}
 
         # Compute loss or just render
         if skip_loss:
-            results = self.render_gaussians(gaussians, model_input.decoder)
-            results['gaussians'] = gaussians
+            results.update(self.render_reconstruction(reconstruction, model_input.decoder))
             return results
         
         # Compute loss
-        results = self.compute_loss(gaussians, model_input.decoder, supervision)
-        results['gaussians'] = gaussians
+        use_mean_of_grads = (
+            self.opt.mean_of_grads != "none"
+            and torch.is_grad_enabled()
+            and not self.opt.use_ttt_for_eval
+        )
+        if use_mean_of_grads:
+            results.update(self.compute_loss_mean_of_grads(reconstruction, model_input.decoder, supervision))
+        else:
+            results.update(self.compute_loss(reconstruction, model_input.decoder, supervision))
         results['images_output'] = supervision.images_output
         return results
 
@@ -377,8 +652,15 @@ class TokenGS(nn.Module):
         n_steps: int = 10,
         lr: float = 1e-3,
     ) -> torch.Tensor:
-        """Test-time training: optimize Gaussian tokens for `n_steps` against input views."""
-        return self.forward_ttt_tokens(model_input, n_steps, lr)
+        """Test-time training against input views."""
+        if self.opt.ttt_mode in ("token-tuning", "tokens"):
+            return self.forward_ttt_tokens(model_input, n_steps, lr)
+        if self.opt.ttt_mode in ("scene-latent-tuning", "latents"):
+            return self.forward_ttt_scene_latents(model_input, n_steps, lr)
+        raise ValueError(
+            f"Unknown ttt_mode: {self.opt.ttt_mode!r}. "
+            "Expected 'token-tuning' or 'scene-latent-tuning'."
+        )
 
     def forward_ttt_tokens(self, model_input: ModelInput, n_steps: int = 10, lr: float = 1e-3) -> torch.Tensor:
         """
@@ -414,9 +696,48 @@ class TokenGS(nn.Module):
             for _ in range(n_steps):
                 optim.zero_grad()
                 gaussians = self.forward_decoder(encoder_latent, model_input.decoder, gs_tokens=gs_tokens)
-                loss = self.compute_loss(gaussians, model_input.decoder, supervision)["loss"]
+                reconstruction = self._reconstruction_from_gaussians(gaussians)
+                loss = self.compute_loss(reconstruction, model_input.decoder, supervision)["loss"]
                 loss.backward()
                 optim.step()
         
         # compute the final result
         return self.forward_decoder(encoder_latent, model_input.decoder, gs_tokens=gs_tokens.detach())
+
+    def forward_ttt_scene_latents(
+        self, model_input: ModelInput, n_steps: int = 10, lr: float = 1e-3
+    ) -> torch.Tensor:
+        """
+        Forward pass using scene latent tuning for `n_steps`.
+
+        The encoder and latent bottleneck run once. TTT then optimizes the
+        per-scene latent bottleneck output, re-projects it to decoder keys and
+        values each step, and keeps the model weights and Gaussian tokens fixed.
+        """
+        model_input_ttt, supervision_ttt = model_input.to_ttt()
+
+        with freeze_model_parameters(self):
+            return self._forward_ttt_scene_latents(model_input_ttt, supervision_ttt, n_steps, lr)
+
+    @torch.no_grad()
+    def _forward_ttt_scene_latents(
+        self, model_input: ModelInput, supervision: ModelSupervision, n_steps: int = 10, lr: float = 1e-3,
+    ) -> torch.Tensor:
+        """Inner loop for forward_ttt_scene_latents; caller holds model frozen."""
+        scene_latents = self.forward_encoder_to_scene_latents(model_input.encoder)
+        gs_tokens = self.get_gs_tokens(batch_size=model_input.batch_size).detach()
+
+        with torch.set_grad_enabled(True):
+            scene_latents = scene_latents.detach().requires_grad_(True)
+            optim = torch.optim.Adam([scene_latents], lr=lr)
+            for _ in range(n_steps):
+                optim.zero_grad()
+                encoder_latent = self.encoder_latent_from_scene_latents(scene_latents)
+                gaussians = self.forward_decoder(encoder_latent, model_input.decoder, gs_tokens=gs_tokens)
+                reconstruction = self._reconstruction_from_gaussians(gaussians)
+                loss = self.compute_loss(reconstruction, model_input.decoder, supervision)["loss"]
+                loss.backward()
+                optim.step()
+
+        encoder_latent = self.encoder_latent_from_scene_latents(scene_latents.detach())
+        return self.forward_decoder(encoder_latent, model_input.decoder, gs_tokens=gs_tokens)

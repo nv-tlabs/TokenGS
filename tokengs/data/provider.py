@@ -18,6 +18,7 @@ import torch
 from torch.utils.data.dataset import Dataset
 import torch.nn.functional as F
 import torchvision.transforms as transforms
+import inspect
 
 from tokengs.utils.data import ImageTransform, ray_condition, timestep_embedding
 from tokengs.options import Options
@@ -32,6 +33,13 @@ from tokengs.data.datafield import (
 )
 
 
+def _accepts_kwarg(sig: inspect.Signature, name: str) -> bool:
+    return name in sig.parameters or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in sig.parameters.values()
+    )
+
+
 class Provider(Dataset):
     def __init__(self, dataset_name: str, opt: Options, training: bool = True, num_repeat: int = 1):
         self.opt = opt
@@ -42,11 +50,21 @@ class Provider(Dataset):
             override_scene_scale = scale_factor
         else:
             override_scene_scale = None
+        dataset_entry = dataset_registry[dataset_name]
+        dataset_kwargs = dict(dataset_entry['kwargs'])
+        if opt.camera_scale_method == 'pointmap':
+            init_sig = inspect.signature(dataset_entry['cls'].__init__)
+            if _accepts_kwarg(init_sig, "load_depth"):
+                dataset_kwargs['load_depth'] = True
         if opt.dataset_kwargs is not None:
-            dataset_registry[dataset_name]['kwargs'].update(opt.dataset_kwargs)
-        self.dataset = dataset_registry[dataset_name]['cls'](**dataset_registry[dataset_name]['kwargs'])
-        self.scene_scale = dataset_registry[dataset_name]['scene_scale'] if override_scene_scale is None else override_scene_scale
-        self.max_gap, self.min_gap = dataset_registry[dataset_name]['max_gap'], dataset_registry[dataset_name]['min_gap']
+            dataset_kwargs.update(opt.dataset_kwargs)
+        self.dataset = dataset_entry['cls'](**dataset_kwargs)
+        self._get_data_accepts_num_depth_frames = _accepts_kwarg(
+            inspect.signature(self.dataset.get_data),
+            "num_depth_frames",
+        )
+        self.scene_scale = dataset_entry['scene_scale'] if override_scene_scale is None else override_scene_scale
+        self.max_gap, self.min_gap = dataset_entry['max_gap'], dataset_entry['min_gap']
         self.training = training
         self.dataset.sample_list *= num_repeat
 
@@ -66,6 +84,8 @@ class Provider(Dataset):
         )
 
         self.data_fields = [DF_IMAGE_RGB, DF_CAMERA_C2W_TRANSFORM, DF_CAMERA_INTRINSICS, DF_FOREGROUND_MASK]
+        if opt.camera_scale_method == 'pointmap':
+            self.data_fields.append(DF_DEPTH)
 
     def set_rng_epoch(self, epoch: int) -> None:
         self.rng = np.random.default_rng(epoch + self.opt.seed)
@@ -97,7 +117,50 @@ class Provider(Dataset):
         c2ws = torch.matmul(pos_avg_inv.unsqueeze(0), c2ws)
         return c2ws
 
+    def _compute_pointmap_scale(self, raw_depths, c2ws, raw_intrinsics):
+        """Normalize cameras by mean input point distance from the origin."""
+        V = min(self.opt.num_input_views, len(raw_depths))
+        all_dists = []
+        for i in range(V):
+            depth = raw_depths[i, 0]
+            valid = depth > 1e-8
+            if not valid.any():
+                continue
+            fx, fy, cx, cy = raw_intrinsics[i]
+            H, W = depth.shape
+            u = torch.arange(W, dtype=torch.float32)
+            v = torch.arange(H, dtype=torch.float32)
+            uu, vv = torch.meshgrid(u, v, indexing='xy')
+            x_cam = (uu - cx) / fx * depth
+            y_cam = (vv - cy) / fy * depth
+            z_cam = depth
+            pts_cam = torch.stack([x_cam, y_cam, z_cam], dim=-1)
+            R = c2ws[i, :3, :3]
+            t = c2ws[i, :3, 3]
+            pts_world = pts_cam[valid] @ R.T + t
+            all_dists.append(pts_world.norm(dim=-1))
+        if len(all_dists) == 0:
+            return 1.0
+        all_dists = torch.cat(all_dists, dim=0)
+
+        lo = float(getattr(self.opt, "pointmap_trim_lo", 0.0))
+        hi = float(getattr(self.opt, "pointmap_trim_hi", 1.0))
+        if not (0.0 <= lo < hi <= 1.0):
+            lo, hi = 0.0, 1.0
+        if (lo > 0.0 or hi < 1.0) and all_dists.numel() > 1:
+            q_lo = torch.quantile(all_dists, lo) if lo > 0.0 else all_dists.min()
+            q_hi = torch.quantile(all_dists, hi) if hi < 1.0 else all_dists.max()
+            trimmed = all_dists[(all_dists >= q_lo) & (all_dists <= q_hi)]
+            if trimmed.numel() > 0:
+                all_dists = trimmed
+
+        return all_dists.mean().clamp(min=1e-6).item()
+
     def _preprocess(self, rgbs, masks, depths, c2ws, intrinsics, timesteps, has_mask):
+        if self.opt.camera_scale_method == 'pointmap':
+            raw_depths = depths.clone()
+            raw_intrinsics = intrinsics.clone()
+
         rgbs, shift, scale, flip_flag = self.image_transform.preprocess_images(rgbs)
         masks, _, _, _ = self.image_transform.preprocess_images(masks)
         depths, _, _, _ = self.image_transform.preprocess_images(depths)
@@ -131,6 +194,9 @@ class Provider(Dataset):
         elif self.opt.camera_scale_method == 'bound':
             position_max = c2ws[: self.opt.num_input_views, :3, 3].abs().max()
             final_scene_scale = self.scene_scale/position_max
+        elif self.opt.camera_scale_method == 'pointmap':
+            avg_dist = self._compute_pointmap_scale(raw_depths, c2ws, raw_intrinsics)
+            final_scene_scale = self.scene_scale / avg_dist
         else:
             raise ValueError(f"Invalid camera scale method: {self.opt.camera_scale_method}")
 
@@ -318,7 +384,16 @@ class Provider(Dataset):
             _curate_batch_fn = self._curate_batch_static if self.dataset.is_static else self._curate_batch_dynamic
 
         frame_indices, view_indices = _get_indices_fn(idx)
-        original_output_dict = self.dataset.get_data(idx, data_fields=self.data_fields, frame_indices=frame_indices, view_indices=view_indices)
+        extra_kwargs = {}
+        if self.opt.camera_scale_method == 'pointmap' and self._get_data_accepts_num_depth_frames:
+            extra_kwargs['num_depth_frames'] = self.opt.num_input_views
+        original_output_dict = self.dataset.get_data(
+            idx,
+            data_fields=self.data_fields,
+            frame_indices=frame_indices,
+            view_indices=view_indices,
+            **extra_kwargs,
+        )
 
         if not (has_mask := (DF_FOREGROUND_MASK in original_output_dict)):
             original_output_dict[DF_FOREGROUND_MASK] = torch.ones_like(

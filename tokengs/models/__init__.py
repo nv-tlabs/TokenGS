@@ -19,6 +19,7 @@ from .input_types import (
     ModelInputDecoder,
     ModelInputEncoder,
     ModelSupervision,
+    Reconstruction,
     split_data,
 )
 from .tokengs import TokenGS
@@ -36,6 +37,7 @@ __all__ = [
     'ModelInputEncoder',
     'ModelInputDecoder',
     'ModelSupervision',
+    'Reconstruction',
     'EncoderLatent',
     'model_registry',
 ]

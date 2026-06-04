@@ -23,8 +23,47 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from tokengs.rendering.fused_ssim import fused_ssim
-from tokengs.models.input_types import ModelSupervision
+from tokengs.models.input_types import ModelInputDecoder, ModelSupervision
 from tokengs.options import Options
+
+
+def project_gaussian_means2d(
+    gaussians_xyz: torch.Tensor,
+    cam_view: torch.Tensor,
+    intrinsics: torch.Tensor,
+) -> torch.Tensor:
+    """Project Gaussian centers with the same camera convention used by the renderer."""
+    gaussians_xyz = gaussians_xyz.float()
+    viewmats = cam_view.to(device=gaussians_xyz.device, dtype=gaussians_xyz.dtype).transpose(-1, -2)
+    intrinsics = intrinsics.to(device=gaussians_xyz.device, dtype=gaussians_xyz.dtype)
+
+    rotation = viewmats[..., :3, :3]
+    translation = viewmats[..., :3, 3]
+    means_camera = torch.einsum("bvij,bnj->bvni", rotation, gaussians_xyz) + translation[:, :, None, :]
+
+    x, y, z = means_camera.unbind(dim=-1)
+    fx, fy, cx, cy = intrinsics.unbind(dim=-1)
+    u = fx[:, :, None] * x / z + cx[:, :, None]
+    v = fy[:, :, None] * y / z + cy[:, :, None]
+    return torch.stack((u, v), dim=-1)
+
+
+def compute_visibility_loss_from_means2d(
+    opt: Options,
+    img_size: tuple[int, int] | list[int],
+    means2d_pred: torch.Tensor,
+) -> torch.Tensor:
+    """Per-scene visibility loss from projected Gaussian centers."""
+    H, W = int(img_size[0]), int(img_size[1])
+    uv = torch.nan_to_num(means2d_pred, nan=0.0, posinf=1e6, neginf=-1e6)
+    scale = torch.tensor([W, H], dtype=uv.dtype, device=uv.device)
+    uv_norm = (uv / scale) * 2 - 1
+    out_of_bounds = F.relu(torch.abs(uv_norm) - 1.0)
+    out_of_bounds = out_of_bounds.sum(-1)
+    vis_loss = out_of_bounds.min(dim=1).values
+    if opt.visibility_distance_threshold > 0:
+        vis_loss = vis_loss.clamp(max=opt.visibility_distance_threshold)
+    return vis_loss.mean(dim=-1)
 
 
 def compute_loss_from_renders(
@@ -32,13 +71,10 @@ def compute_loss_from_renders(
     img_size: tuple[int, int] | list[int],
     pred_images: torch.Tensor,
     pred_masks: torch.Tensor,
-    means2d_pred: torch.Tensor,
     gt_images: torch.Tensor,
     gt_masks: torch.Tensor,
     has_mask: torch.Tensor,
-    _means3d_pred: torch.Tensor,
-    rays_os: torch.Tensor,
-    rays_ds: torch.Tensor,
+    lpips_loss: Optional[nn.Module] = None,
 ) -> dict:
     """Per-scene loss from rendered predictions (intended for use inside torch.vmap)."""
     H, W = int(img_size[0]), int(img_size[1])
@@ -46,11 +82,15 @@ def compute_loss_from_renders(
     assert has_mask.shape == (pred_images.shape[0],), "has_mask must have the same batch size as pred_images"
 
     bg_color = torch.ones(3, dtype=pred_images.dtype, device=pred_images.device)
+    gt_images_lpips = gt_images
     gt_images = gt_images * gt_masks + bg_color.view(1, 1, 3, 1, 1) * (1 - gt_masks)
 
-    loss_mse = F.mse_loss(pred_images, gt_images)
-    loss = loss_mse
-    results["loss_mse"] = loss_mse
+    if opt.rgb_loss_type == "l1":
+        loss_rgb = F.l1_loss(pred_images, gt_images)
+    else:
+        loss_rgb = F.mse_loss(pred_images, gt_images)
+    loss = opt.lambda_rgb * loss_rgb
+    results["loss_rgb"] = loss_rgb
 
     if opt.lambda_mask > 0:
         loss_mse_mask = F.mse_loss(pred_masks, gt_masks, reduction="none").mean(dim=(1, 2, 3, 4))
@@ -67,17 +107,14 @@ def compute_loss_from_renders(
         loss = loss + opt.lambda_ssim * loss_ssim
         results["loss_ssim"] = loss_ssim
 
-    if opt.lambda_visibility > 0:
-        uv = torch.nan_to_num(means2d_pred, nan=0.0, posinf=1e6, neginf=-1e6)
-        uv_norm = (uv / torch.tensor([W, H], device=uv.device)) * 2 - 1
-        out_of_bounds = F.relu(torch.abs(uv_norm) - 1.0)
-        out_of_bounds = out_of_bounds.sum(-1)
-        vis_loss = out_of_bounds.min(dim=1).values
-        if opt.visibility_distance_threshold > 0:
-            vis_loss = vis_loss.clamp(max=opt.visibility_distance_threshold)
-        vis_loss = vis_loss.mean()
-        loss = loss + vis_loss * opt.lambda_visibility
-        results["loss_visibility"] = vis_loss
+    lambda_lpips = float(opt.lambda_lpips)
+    if lambda_lpips > 0 and lpips_loss is not None:
+        loss_lpips = lpips_loss(
+            gt_images_lpips.view(-1, 3, H, W),
+            pred_images.view(-1, 3, H, W),
+            normalize=True,
+        ).mean()
+        results["loss_lpips"] = loss_lpips
 
     results["loss"] = loss
 
@@ -93,52 +130,51 @@ def compute_tokengs_loss(
     img_size: tuple[int, int] | list[int],
     render_results: dict,
     supervision: ModelSupervision,
-    gaussians_xyz: torch.Tensor,
+    decoder_input: ModelInputDecoder,
+    gaussians: torch.Tensor,
     lpips_loss: Optional[nn.Module],
 ) -> dict:
-    """Aggregate training loss from renderer outputs and supervision (includes LPIPS outside vmap)."""
+    """Aggregate training loss from renderer outputs and supervision."""
     pred_images = render_results["images_pred"]
     pred_masks = render_results["alphas_pred"]
-    means2d_pred = render_results["means2d_pred"]
     depths_pred = render_results["depths_pred"]
     gt_images = supervision.images_output
 
-    per_scene = partial(compute_loss_from_renders, opt, img_size)
+    gaussians_xyz = gaussians[..., :3]
+    per_scene = partial(compute_loss_from_renders, opt, img_size, lpips_loss=lpips_loss)
 
-    if supervision.rays_os is None:
-        in_dims = (0,) * 7 + ((None,) * 2)
-        rays_os = supervision.rays_os
-        rays_ds = supervision.rays_ds
-    else:
-        in_dims = (0,) * 9
-        rays_os = supervision.rays_os.unsqueeze(1)
-        rays_ds = supervision.rays_ds.unsqueeze(1)
-
-    results_per_scene = torch.vmap(per_scene, in_dims=in_dims)(
+    results_per_scene = torch.vmap(per_scene, in_dims=(0,) * 5)(
         pred_images.unsqueeze(1),
         pred_masks.unsqueeze(1),
-        means2d_pred.unsqueeze(1),
         supervision.images_output.unsqueeze(1),
         supervision.masks_output.unsqueeze(1),
         supervision.has_mask.unsqueeze(1),
-        gaussians_xyz.unsqueeze(1),
-        rays_os,
-        rays_ds,
     )
 
     if "loss_mask" in results_per_scene:
         results_per_scene["loss_mask"] = results_per_scene["loss_mask"] / (supervision.has_mask.float().sum() + 1e-6)
 
+    if "loss_lpips" in results_per_scene:
+        results_per_scene["loss"] = results_per_scene["loss"] + float(opt.lambda_lpips) * results_per_scene["loss_lpips"]
+
+    if opt.lambda_visibility > 0:
+        if decoder_input.cam_view is None:
+            raise ValueError("decoder_input.cam_view is required for visibility loss")
+        if decoder_input.intrinsics is None:
+            raise ValueError("decoder_input.intrinsics is required for visibility loss")
+        means2d_pred = project_gaussian_means2d(gaussians_xyz, decoder_input.cam_view, decoder_input.intrinsics)
+        loss_visibility = compute_visibility_loss_from_means2d(opt, img_size, means2d_pred)
+        results_per_scene["loss_visibility"] = loss_visibility
+        results_per_scene["loss"] = results_per_scene["loss"] + opt.lambda_visibility * loss_visibility
+
     result_means = {k: v.mean() for k, v in results_per_scene.items()}
     results_per_scene = {f"{k}_per_scene": v for k, v in results_per_scene.items()}
 
-    if opt.lambda_lpips > 0 and lpips_loss is not None:
-        H, W = int(img_size[0]), int(img_size[1])
-        gt_flat = gt_images.view(-1, 3, H, W)
-        pred_flat = pred_images.view(-1, 3, H, W)
-        loss_lpips = lpips_loss(gt_flat, pred_flat, normalize=True).mean()
-        result_means["loss_lpips"] = loss_lpips
-        result_means["loss"] = result_means["loss"] + opt.lambda_lpips * loss_lpips
+    if opt.lambda_opacity > 0:
+        opacity = gaussians[..., 3:4]
+        loss_opacity = -torch.log(opacity + 1e-6).mean()
+        result_means["loss_opacity"] = loss_opacity
+        result_means["loss"] = result_means["loss"] + opt.lambda_opacity * loss_opacity
 
     return {
         **result_means,
