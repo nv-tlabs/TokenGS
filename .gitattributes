@@ -1,2 +1,4 @@
 *.pt filter=lfs diff=lfs merge=lfs -text
 assets/tokengs_explore.gif filter=lfs diff=lfs merge=lfs -text
+assets/kubric_dynamic_static_scene_002.gif filter=lfs diff=lfs merge=lfs -text
+assets/sweep_r26.06.gif filter=lfs diff=lfs merge=lfs -text

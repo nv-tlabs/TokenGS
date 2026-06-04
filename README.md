@@ -10,6 +10,12 @@ Jiawei Ren*, Michal Tyszkiewicz*, Jiahui Huang†, Zan Gojcic† <br>
 
 TokenGS predicts 3D Gaussians with a self-supervised rendering objective. An encoder–decoder stacks learnable Gaussian tokens so the number of primitives is not tied to image resolution or view count.
 
+## News
+
+- **2026.6.3:** Model improvement release: Latent bottleneck models, Scene-latent tuning, and Mean-of-gradients training. See the [release_2026.6](release_2026.6.md) note.
+- **2026.6.3:** Released Kubric training and inference.
+- **2026.6.2:** Released TokenGS model weights on [HuggingFace](https://huggingface.co/jiaweir/tokengs).
+
 ## Installation
 
 Install the package in editable mode (dependencies include PyTorch, gsplat, and [fused-ssim](https://github.com/rahul-goel/fused-ssim) via `pyproject.toml`):
@@ -25,6 +31,12 @@ uv pip install -e .
 ## Evaluation
 
 Place weights under `checkpoints/` (or pass any path to `--resume`). Metrics are written to `<workspace>/metrics.txt`; the workspace directory is created automatically.
+
+| Checkpoint | Eval preset |
+|------------|-------------|
+| `dl3dv_2v.safetensors` | `eval_dl3dv_2view` |
+| `dl3dv_4v.safetensors` | `eval_dl3dv_4view` |
+| `dl3dv_6v.safetensors` | `eval_dl3dv_6view` |
 
 **Example (6-view preset):**
 
@@ -65,6 +77,54 @@ accelerate launch --config_file acc_configs/gpu8.yaml \
 
 Swap the subcommand for 4- or 6-view finetune presets as needed.
 
+## Kubric Dynamic Model
+
+A Kubric dynamic checkpoint is available at `checkpoints_26.06/kubric_dyn.safetensors`. Point `data/kubric` at the Kubric4D dataset:
+
+<img src="assets/kubric_dynamic_static_scene_002.gif" alt="Kubric dynamic model visualization: all, dynamic-only, and static-only renders for scene 002" width="512">
+
+```text
+data/kubric/
+  v0/
+    <scene>/
+      output_000.tar
+      output_001.tar
+      ...
+  v1/
+  v2/
+  ...
+```
+
+The top-level `v0`, `v1`, `v2`, ... folders are data splits. Each `output_{view:03d}.tar` contains `metadata.json`, `rgba_{frame:05d}.png`, and `depth_{frame:05d}.tiff`. The dynamic presets use pointmap camera scaling, so input-frame depth TIFFs are loaded for scale normalization.
+
+### Warm-Start Strategy
+
+The released dynamic preset warm-starts static GS tokens from the DL3DV base checkpoint and initializes dynamic GS tokens from the static tokens. Its auxiliary dynamic-only render loss is held at `0.3` for 5K steps, then linearly decays to `0` over the next 10K steps.
+
+Finetune example:
+
+```bash
+accelerate launch --config_file acc_configs/gpu8.yaml \
+    -m tokengs.train finetune_dl3dv_kubric_dyn_release \
+    --workspace workspace/kubric_dyn \
+    --experiment_name kubric_dyn \
+    --resume checkpoints/dl3dv_base.safetensors
+```
+
+The render script uses the released Kubric preset by default; pass `--workspace` only when rendering a finetuned workspace with its own `config.yaml`.
+
+```bash
+python scripts/render_kubric_dyn.py \
+    --preset finetune_dl3dv_kubric_dyn_release \
+    --ckpt checkpoints_26.06/kubric_dyn.safetensors \
+    --kubric_root data/kubric \
+    --out_dir results/kubric_dyn_renders \
+    --scene_idx 0 \
+    --n_scenes 4 \
+    --fps 8
+```
+
+For each scene, the render script writes fixed-camera, trajectory, dynamic-only, static-only, and input-camera hstack videos.
 
 ## License
 
