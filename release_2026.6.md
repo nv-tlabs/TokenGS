@@ -4,6 +4,8 @@
 
 This note documents the June 2026 TokenGS model updates.
 
+Model weights are available on Hugging Face under [checkpoints_26.06](https://huggingface.co/jiaweir/tokengs/tree/main/checkpoints_26.06).
+
 ## Overview
 
 - **Latent bottleneck models:** new 2-, 4-, and 6-view DL3DV checkpoints with a 12-layer encoder, multiscale encoder readout, and 4096 learned scene latent tokens.

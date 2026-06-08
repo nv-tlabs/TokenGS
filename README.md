@@ -12,7 +12,7 @@ TokenGS predicts 3D Gaussians with a self-supervised rendering objective. An enc
 
 ## News
 
-- **2026.6.3:** Model improvement release: Latent bottleneck models, Scene-latent tuning, and Mean-of-gradients training. See the [release_2026.6](release_2026.6.md) note.
+- **2026.6.3:** Model improvement release: Latent bottleneck models, Scene-latent tuning, and Mean-of-gradients training. See the [release_2026.6](release_2026.6.md) note and [checkpoints_26.06 weights](https://huggingface.co/jiaweir/tokengs/tree/main/checkpoints_26.06).
 - **2026.6.3:** Released Kubric training and inference.
 - **2026.6.2:** Released TokenGS model weights on [HuggingFace](https://huggingface.co/jiaweir/tokengs).
 
