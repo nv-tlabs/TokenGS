@@ -43,7 +43,6 @@ from tokengs.models.losses import (
     compute_loss_from_renders,
     compute_tokengs_loss,
     compute_visibility_loss_from_means2d,
-    project_gaussian_means2d,
 )
 from tokengs.utils.training import freeze_model_parameters
 
@@ -554,7 +553,8 @@ class TokenGS(nn.Module):
 
             if self.opt.lambda_visibility > 0:
                 decoder_scene = decoder_input.select_batch(slice(scene_start, scene_end), slice(0, num_views))
-                means2d_pred = project_gaussian_means2d(gaussians_scene[..., :3], decoder_scene.cam_view, decoder_scene.intrinsics)
+                visibility_render = self.render_reconstruction(reconstruction_scene, decoder_scene)
+                means2d_pred = visibility_render["means2d_pred"]
                 loss_visibility = compute_visibility_loss_from_means2d(self.opt, self.img_size, means2d_pred)
                 scaled_visibility = self.opt.lambda_visibility * loss_visibility.sum() / batch_size
                 grad_visibility = torch.autograd.grad(

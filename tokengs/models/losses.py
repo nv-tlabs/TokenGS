@@ -27,27 +27,6 @@ from tokengs.models.input_types import ModelInputDecoder, ModelSupervision
 from tokengs.options import Options
 
 
-def project_gaussian_means2d(
-    gaussians_xyz: torch.Tensor,
-    cam_view: torch.Tensor,
-    intrinsics: torch.Tensor,
-) -> torch.Tensor:
-    """Project Gaussian centers with the same camera convention used by the renderer."""
-    gaussians_xyz = gaussians_xyz.float()
-    viewmats = cam_view.to(device=gaussians_xyz.device, dtype=gaussians_xyz.dtype).transpose(-1, -2)
-    intrinsics = intrinsics.to(device=gaussians_xyz.device, dtype=gaussians_xyz.dtype)
-
-    rotation = viewmats[..., :3, :3]
-    translation = viewmats[..., :3, 3]
-    means_camera = torch.einsum("bvij,bnj->bvni", rotation, gaussians_xyz) + translation[:, :, None, :]
-
-    x, y, z = means_camera.unbind(dim=-1)
-    fx, fy, cx, cy = intrinsics.unbind(dim=-1)
-    u = fx[:, :, None] * x / z + cx[:, :, None]
-    v = fy[:, :, None] * y / z + cy[:, :, None]
-    return torch.stack((u, v), dim=-1)
-
-
 def compute_visibility_loss_from_means2d(
     opt: Options,
     img_size: tuple[int, int] | list[int],
@@ -140,7 +119,6 @@ def compute_tokengs_loss(
     depths_pred = render_results["depths_pred"]
     gt_images = supervision.images_output
 
-    gaussians_xyz = gaussians[..., :3]
     per_scene = partial(compute_loss_from_renders, opt, img_size, lpips_loss=lpips_loss)
 
     results_per_scene = torch.vmap(per_scene, in_dims=(0,) * 5)(
@@ -158,11 +136,7 @@ def compute_tokengs_loss(
         results_per_scene["loss"] = results_per_scene["loss"] + float(opt.lambda_lpips) * results_per_scene["loss_lpips"]
 
     if opt.lambda_visibility > 0:
-        if decoder_input.cam_view is None:
-            raise ValueError("decoder_input.cam_view is required for visibility loss")
-        if decoder_input.intrinsics is None:
-            raise ValueError("decoder_input.intrinsics is required for visibility loss")
-        means2d_pred = project_gaussian_means2d(gaussians_xyz, decoder_input.cam_view, decoder_input.intrinsics)
+        means2d_pred = render_results["means2d_pred"]
         loss_visibility = compute_visibility_loss_from_means2d(opt, img_size, means2d_pred)
         results_per_scene["loss_visibility"] = loss_visibility
         results_per_scene["loss"] = results_per_scene["loss"] + opt.lambda_visibility * loss_visibility
