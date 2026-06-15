@@ -76,7 +76,7 @@ class Options:
     pointmap_trim_lo: float = 0.0
     pointmap_trim_hi: float = 1.0
     num_workers: int = 16
-    dataset_kwargs: dict[str, Any] | None = None
+    dataset_kwargs: dict[str, str] | None = None
 
     # --- training
     batch_size: int = 8
@@ -277,29 +277,12 @@ config_doc["train_dl3dv_latent_base"] = (
     "rescaling, the 12-layer encoder latent architecture, and no checkpoint "
     "initialization."
 )
-config_defaults["train_dl3dv_latent_base"] = config_defaults["train_dl3dv_base"].evolve(
+config_defaults["train_dl3dv_latent_base"] = Options(
     data_mode=(("dl3dv_scaled_1.0", 6),),
-    dataset_kwargs={
-        "exclude_eval_scenes": [
-            "assets/evaluation_idx_dl3dv_depthsplat_2v.json",
-            "assets/evaluation_idx_dl3dv_depthsplat_4v.json",
-            "assets/evaluation_idx_dl3dv_depthsplat_6v.json",
-        ],
-    },
-    img_size=(256, 256),
-    num_input_views=4,
-    num_views=8,
     num_epochs=178,
-    max_iters_per_epoch=1_000_000,
-    lr=4e-4,
     pct_start_steps=2000,
-    batch_size=8,
-    gradient_accumulation_steps=1,
-    num_gs_tokens=1024,
-    num_latents=4096,
     enc_depth=12,
     dec_depth=1,
-    dec_patch_size=8,
     clip_head_z_init=0.1,
     dec_init_values=0.01,
     gaussian_z_offset=0.0,
@@ -309,13 +292,8 @@ config_defaults["train_dl3dv_latent_base"] = config_defaults["train_dl3dv_base"]
     use_input_supervision=True,
     rgb_loss_type="l1",
     lambda_rgb=0.8,
-    lambda_ssim=0.2,
-    lambda_lpips=0.0,
     use_latent_bottleneck=True,
     use_multiscale_encoder=True,
-    multiscale_encoder_layers=(5, 7, 9, 11),
-    init_tokens_from_existing=False,
-    init_latents_from_existing=False,
 )
 
 
