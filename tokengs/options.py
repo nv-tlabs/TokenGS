@@ -281,19 +281,10 @@ config_defaults["train_dl3dv_latent_base"] = Options(
     data_mode=(("dl3dv_scaled_1.0", 6),),
     num_epochs=178,
     pct_start_steps=2000,
-    enc_depth=12,
-    dec_depth=1,
-    clip_head_z_init=0.1,
-    dec_init_values=0.01,
-    gaussian_z_offset=0.0,
-    gs_token_std=0.02,
-    camera_normalization_method="mean_cam",
-    camera_scale_method="pointmap",
     use_input_supervision=True,
     rgb_loss_type="l1",
     lambda_rgb=0.8,
-    use_latent_bottleneck=True,
-    use_multiscale_encoder=True,
+    **{**_LATENT_D12_ARCH, "camera_scale_method": "pointmap"},
 )
 
 
