@@ -305,8 +305,6 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
 
     def train_step(data, should_log_images, iteration):
         """Execute a single training step and return metrics."""
-        optimizer.zero_grad()
-
         global_step_for_aux = epoch * iters_per_epoch + iteration
         unwrapped_model = accelerator.unwrap_model(model)
         if hasattr(unwrapped_model, "compute_lambda_dyn_aux_eff"):
@@ -327,6 +325,7 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
         optimizer.step()
         if accelerator.sync_gradients:
             scheduler.step()
+        optimizer.zero_grad()
 
         loss_value = loss.detach()
         psnr_value = psnr.detach()
@@ -347,6 +346,8 @@ def train_epoch(opt, accelerator, model, optimizer, scheduler, train_dataloader,
             log_training_images(opt, accelerator, data, out, epoch, iteration, writer, is_train=True)
         
         return loss_value, loss_value_detailed, psnr_value
+
+    model.zero_grad(set_to_none=True)
 
     train_dataset.set_rng_epoch(epoch)
     if accelerator.is_main_process:
